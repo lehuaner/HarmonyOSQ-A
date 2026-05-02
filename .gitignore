@@ -45,6 +45,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+抓包数据_解析结果/
 
 # Translations
 *.mo
