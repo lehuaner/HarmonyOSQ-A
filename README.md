@@ -24,6 +24,8 @@ pip install httpx
 python qa.py float.json里可以写24vp吗
 ```
 
+回答完毕后自动退出。
+
 ### 交互模式
 
 ```bash
