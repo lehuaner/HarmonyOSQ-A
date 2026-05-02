@@ -1,251 +1,207 @@
 """
-HarmonyOS Q&A 脚本
-基于抓包数据_解析结果中的内容，回答用户关于 HarmonyOS 开发的问题
+华为开发者网站智能客服脚本
+通过调用华为开发者官网的智能客服 API，实现交互式问答
+流式输出 AI 回答
 """
 
+import hashlib
 import json
-import os
+import random
 import re
+import string
 import sys
-from pathlib import Path
+import time
 
-DATA_DIR = Path(__file__).parent / "抓包数据_解析结果"
+import httpx
 
+# 强制 stdout 无缓冲，确保流式输出立即可见
+sys.stdout.reconfigure(write_through=True)
 
-def load_all_responses():
-    """加载所有解析结果中的响应体内容"""
-    results = []
+BASE_URL = "https://svc-drcn.developer.huawei.com/intelligentcustomer/v1/public/dialog"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Origin": "https://developer.huawei.com",
+    "Referer": "https://developer.huawei.com/",
+    "Accept": "application/json, text/plain, */*",
+}
 
-    if not DATA_DIR.exists():
-        print(f"错误：数据目录不存在 - {DATA_DIR}")
-        return results
+SSE_HEADERS = {
+    **HEADERS,
+    "Accept": "text/event-stream",
+    # 禁用压缩，避免解压缓冲导致延迟
+    "Accept-Encoding": "identity",
+}
 
-    for dirpath in sorted(DATA_DIR.iterdir()):
-        if not dirpath.is_dir():
-            continue
-
-        # 读取响应体 JSON
-        json_file = dirpath / "响应体.json"
-        if json_file.exists():
-            try:
-                with open(json_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                results.append({
-                    "source": dirpath.name,
-                    "type": "json",
-                    "data": data,
-                })
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-
-        # 读取响应体 HTML
-        html_file = dirpath / "响应体.html"
-        if html_file.exists():
-            try:
-                with open(html_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                results.append({
-                    "source": dirpath.name,
-                    "type": "html",
-                    "data": content,
-                })
-            except UnicodeDecodeError:
-                pass
-
-        # 读取响应 TXT（含 SSE 流式数据）
-        txt_file = dirpath / "响应.txt"
-        if txt_file.exists():
-            try:
-                with open(txt_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                results.append({
-                    "source": dirpath.name,
-                    "type": "txt",
-                    "data": content,
-                })
-            except UnicodeDecodeError:
-                pass
-
-    return results
+# 打字机效果：每字符输出间隔（秒）
+TYPEWRITER_DELAY = 0.016
 
 
-def extract_intelligent_customer_answer(responses):
-    """从智能客服的流式响应中提取完整回答"""
+def generate_anonymous_id():
+    """生成匿名 ID（MD5 哈希 + '_search' 后缀）"""
+    random_str = "".join(random.choices(string.hexdigits, k=32))
+    md5 = hashlib.md5(random_str.encode()).hexdigest()
+    return f"{md5}_search"
+
+
+def create_dialog(anonymous_id, client):
+    """创建对话，获取 dialogId"""
+    url = f"{BASE_URL}/id"
+    payload = {
+        "anonymousId": anonymous_id,
+        "type": 1001,
+        "origin": 4,
+    }
+
+    resp = client.post(url, json=payload, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"创建对话失败: {data.get('message', '未知错误')}")
+
+    dialog_id = data["result"]["dialogId"]
+    return dialog_id
+
+
+def submit_question(query, dialog_id, anonymous_id, client):
+    """提交问题，接收 SSE 流式响应，从"生成总结"开始实时打印"""
+    url = f"{BASE_URL}/submission"
+    payload = {
+        "query": query,
+        "dialogId": dialog_id,
+        "anonymousId": anonymous_id,
+        "channel": 1,
+        "subType": 1,
+        "type": 1001,
+        "origin": 4,
+        "thinkType": 0,
+    }
+
     full_answer = ""
     references = []
+    streaming_started = False
+    printed_len = 0
+    buffer = ""
 
-    for item in responses:
-        if item["type"] != "txt":
-            continue
-        if "intelligentcustomer" not in item["source"]:
-            continue
+    # 使用 httpx 的流式请求 + HTTP/2，绕过 CDN 对 HTTP/1.1 的缓冲
+    with client.stream("POST", url, json=payload, headers=SSE_HEADERS, timeout=120) as resp:
+        resp.raise_for_status()
 
-        content = item["data"]
-        # 解析 SSE 格式的流式数据
-        for line in content.split("\n"):
-            line = line.strip()
-            if not line.startswith("data:"):
+        # 逐字节流式读取，SSE 数据到达即处理
+        for chunk in resp.iter_bytes():
+            if not chunk:
                 continue
+            buffer += chunk.decode("utf-8", errors="replace")
 
-            json_str = line[5:].strip()
-            if not json_str:
-                continue
+            # 按 SSE 事件边界解析（双换行分隔）
+            while "\n\n" in buffer:
+                event_text, buffer = buffer.split("\n\n", 1)
 
-            try:
-                data = json.loads(json_str)
-            except json.JSONDecodeError:
-                continue
+                for line in event_text.split("\n"):
+                    if not line.startswith("data:"):
+                        continue
 
-            result = data.get("result", {})
-            streaming_text = result.get("streamingText", "")
-            if streaming_text:
-                full_answer = streaming_text  # 每个 chunk 包含累积文本，取最新的
+                    json_str = line[5:].strip()
+                    if not json_str:
+                        continue
 
-            refs = result.get("resultReferences", [])
-            if refs:
-                references = refs
+                    try:
+                        data = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    result = data.get("result", {})
+
+                    # 检测"生成总结"阶段，开始流式打印
+                    if not streaming_started:
+                        step_info = result.get("stepInfo", "")
+                        if "生成总结" in step_info:
+                            streaming_started = True
+
+                    # 累积流式文本
+                    streaming_text = result.get("streamingText", "")
+                    if streaming_text:
+                        clean_text = re.sub(r"<rsup[^>]*>.*?</rsup>", "", streaming_text)
+                        full_answer = streaming_text
+
+                        # 打字机效果：逐字符打印增量部分
+                        if streaming_started and len(clean_text) > printed_len:
+                            delta = clean_text[printed_len:]
+                            for ch in delta:
+                                sys.stdout.write(ch)
+                                sys.stdout.flush()
+                                time.sleep(TYPEWRITER_DELAY)
+                            printed_len = len(clean_text)
+
+                    # 提取参考来源
+                    refs = result.get("resultReferences", [])
+                    if refs:
+                        references = refs
+
+                    # 回答完毕
+                    if result.get("isFinal"):
+                        if streaming_started:
+                            print()
+                        return full_answer, references
+
+    # 流意外结束
+    if streaming_started:
+        print()
 
     return full_answer, references
 
 
-def search_in_json_data(responses, keywords):
-    """在 JSON 响应数据中搜索关键词相关内容"""
-    matches = []
-
-    for item in responses:
-        if item["type"] != "json":
-            continue
-
-        text = json.dumps(item["data"], ensure_ascii=False)
-
-        # 计算关键词命中数
-        hit_count = sum(1 for kw in keywords if kw.lower() in text.lower())
-        if hit_count > 0:
-            matches.append({
-                "source": item["source"],
-                "hit_count": hit_count,
-                "data": item["data"],
-            })
-
-    # 按命中数排序
-    matches.sort(key=lambda x: x["hit_count"], reverse=True)
-    return matches
+def clean_answer(text):
+    """清理回答文本中的 XML 标签"""
+    text = re.sub(r"<rsup[^>]*>.*?</rsup>", "", text)
+    return text.strip()
 
 
-def extract_search_highlights(matches, keywords):
-    """从搜索结果中提取高亮信息摘要"""
-    summaries = []
+def ask(query, client=None, anonymous_id=None):
+    """提问并获取回答"""
+    if client is None:
+        # 启用 HTTP/2，这是流式输出的关键！
+        # CDN/反向代理通常对 HTTP/1.1 的 SSE 流做整段缓冲，
+        # 而对 HTTP/2 直接透传，浏览器用 HTTP/2 所以流式正常。
+        client = httpx.Client(http2=True)
+    if anonymous_id is None:
+        anonymous_id = generate_anonymous_id()
 
-    for match in matches[:5]:  # 最多取前5条
-        data = match["data"]
-
-        # 处理搜索结果
-        search_result = data.get("searchResult", [])
-        for sr in search_result:
-            dev_infos = sr.get("developerInfos", [])
-            for info in dev_infos:
-                title = info.get("name", "")
-                url = info.get("url", "")
-                desc = info.get("description", "")
-
-                highlights = info.get("highlightInfos", [])
-                highlight_texts = []
-                for h in highlights:
-                    h_content = h.get("content", "")
-                    # 去掉 HTML 标签
-                    clean = re.sub(r"<[^>]+>", "", h_content)
-                    # 截取包含关键词的片段
-                    for kw in keywords:
-                        idx = clean.lower().find(kw.lower())
-                        if idx != -1:
-                            start = max(0, idx - 50)
-                            end = min(len(clean), idx + len(kw) + 200)
-                            snippet = clean[start:end]
-                            if start > 0:
-                                snippet = "..." + snippet
-                            if end < len(clean):
-                                snippet = snippet + "..."
-                            highlight_texts.append(snippet)
-
-                if title or highlight_texts:
-                    summaries.append({
-                        "title": title,
-                        "url": "https:" + url if url.startswith("//") else url,
-                        "highlights": highlight_texts[:2],
-                    })
-
-    return summaries
-
-
-def answer_question(question):
-    """根据抓包数据回答问题"""
-    print(f"\n问题：{question}\n")
-    print("=" * 70)
-
-    # 加载所有响应数据
-    responses = load_all_responses()
-    if not responses:
-        print("未找到任何抓包数据，请确认 抓包数据_解析结果 目录存在且不为空。")
-        return
-
-    # 提取关键词
-    keywords = [w for w in re.split(r"[，。？？\s\"\"\"+\-+/()（）]", question) if len(w) >= 2]
-    if not keywords:
-        keywords = [question]
-
-    # 1. 优先从智能客服回答中查找
-    answer, references = extract_intelligent_customer_answer(responses)
-    if answer:
-        # 检查回答是否与问题相关（至少命中一个关键词）
-        relevant = any(kw.lower() in answer.lower() for kw in keywords)
-        if relevant:
-            print("【智能客服回答】\n")
-            # 去掉 XML 标签
-            clean_answer = re.sub(r"<rsup[^>]*>.*?</rsup>", "", answer)
-            clean_answer = clean_answer.strip()
-            print(clean_answer)
-
-            if references:
-                print("\n【参考来源】")
-                for i, ref in enumerate(references, 1):
-                    print(f"  [{i}] {ref.get('title', '')}")
-                    url = ref.get("url", "")
-                    if url:
-                        print(f"      {url}")
-
-            print()
-            return
-
-    # 2. 从搜索结果中查找
-    matches = search_in_json_data(responses, keywords)
-    if matches:
-        summaries = extract_search_highlights(matches, keywords)
-        if summaries:
-            print("【搜索结果摘要】\n")
-            for i, s in enumerate(summaries, 1):
-                print(f"  {i}. {s['title']}")
-                print(f"     链接：{s['url']}")
-                for h in s["highlights"]:
-                    print(f"     > {h}")
-                print()
-            return
-
-    # 3. 未找到相关信息
-    print("抱歉，在抓包数据中未找到与该问题相关的信息。")
-    print("建议访问华为开发者官网搜索：https://developer.huawei.com/consumer/cn/")
+    dialog_id = create_dialog(anonymous_id, client)
+    answer, references = submit_question(query, dialog_id, anonymous_id, client)
+    return answer, references
 
 
 def main():
-    print("=" * 70)
-    print("  HarmonyOS Q&A - 基于抓包数据的问答系统")
-    print("  输入问题获取答案，输入 q 退出")
-    print("=" * 70)
 
+    # 命令行直接传入问题
     if len(sys.argv) > 1:
-        # 命令行直接传入问题
         question = " ".join(sys.argv[1:])
-        answer_question(question)
-        return
+        client = httpx.Client(http2=True)
+        anonymous_id = generate_anonymous_id()
+
+        print(f"\n问题：{question}\n")
+        try:
+            answer, references = ask(question, client, anonymous_id)
+        except Exception as e:
+            print(f"\n请求失败: {e}")
+            sys.exit(1)
+
+        if references:
+            print("\n【参考来源】")
+            for i, ref in enumerate(references, 1):
+                print(f"  [{i}] {ref.get('title', '')}")
+                url = ref.get("url", "")
+                if url:
+                    print(f"      {url}")
+
+        client.close()
+        sys.exit(0)
+
+    # 交互模式
+    client = httpx.Client(http2=True)
+    anonymous_id = generate_anonymous_id()
 
     while True:
         print()
@@ -261,7 +217,23 @@ def main():
             print("再见！")
             break
 
-        answer_question(question)
+        try:
+            answer, references = ask(question, client, anonymous_id)
+        except Exception as e:
+            print(f"\n请求失败: {e}")
+            continue
+
+        if references:
+            print("\n【参考来源】")
+            for i, ref in enumerate(references, 1):
+                print(f"  [{i}] {ref.get('title', '')}")
+                url = ref.get("url", "")
+                if url:
+                    print(f"      {url}")
+
+        print()
+
+    client.close()
 
 
 if __name__ == "__main__":
